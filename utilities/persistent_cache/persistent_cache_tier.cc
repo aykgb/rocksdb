@@ -5,16 +5,11 @@
 //
 #ifndef ROCKSDB_LITE
 
-#ifndef __STDC_FORMAT_MACROS
-#define __STDC_FORMAT_MACROS
-#endif
-
 #include "utilities/persistent_cache/persistent_cache_tier.h"
 
-#include "inttypes.h"
-
-#include <string>
+#include <cinttypes>
 #include <sstream>
+#include <string>
 
 namespace rocksdb {
 
@@ -75,12 +70,12 @@ Status PersistentCacheTier::Close() {
   return Status::OK();
 }
 
-bool PersistentCacheTier::Reserve(const size_t size) {
+bool PersistentCacheTier::Reserve(const size_t /*size*/) {
   // default implementation is a pass through
   return true;
 }
 
-bool PersistentCacheTier::Erase(const Slice& key) {
+bool PersistentCacheTier::Erase(const Slice& /*key*/) {
   // default implementation is a pass through since not all cache tiers might
   // support erase
   return true;

@@ -32,10 +32,10 @@
 
 #pragma once
 #include <assert.h>
-#include <atomic>
 #include <stdlib.h>
+#include <atomic>
+#include "memory/allocator.h"
 #include "port/port.h"
-#include "util/allocator.h"
 #include "util/random.h"
 
 namespace rocksdb {
@@ -51,6 +51,9 @@ class SkipList {
   // allocator must remain allocated for the lifetime of the skiplist object.
   explicit SkipList(Comparator cmp, Allocator* allocator,
                     int32_t max_height = 12, int32_t branching_factor = 4);
+  // No copying allowed
+  SkipList(const SkipList&) = delete;
+  void operator=(const SkipList&) = delete;
 
   // Insert key into the list.
   // REQUIRES: nothing that compares equal to key is currently in the list.
@@ -158,10 +161,6 @@ class SkipList {
   // Return the last node in the list.
   // Return head_ if list is empty.
   Node* FindLast() const;
-
-  // No copying allowed
-  SkipList(const SkipList&);
-  void operator=(const SkipList&);
 };
 
 // Implementation details follow
@@ -409,8 +408,8 @@ template <typename Key, class Comparator>
 SkipList<Key, Comparator>::SkipList(const Comparator cmp, Allocator* allocator,
                                     int32_t max_height,
                                     int32_t branching_factor)
-    : kMaxHeight_(max_height),
-      kBranching_(branching_factor),
+    : kMaxHeight_(static_cast<uint16_t>(max_height)),
+      kBranching_(static_cast<uint16_t>(branching_factor)),
       kScaledInverseBranching_((Random::kMaxNext + 1) / kBranching_),
       compare_(cmp),
       allocator_(allocator),

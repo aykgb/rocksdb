@@ -16,10 +16,12 @@ import java.util.List;
  * during the creation of a {@link org.rocksdb.RocksDB} (i.e., RocksDB.open()).
  *
  * If {@link #dispose()} function is not called, then it will be GC'd
- * automaticallyand native resources will be released as part of the process.
+ * automatically and native resources will be released as part of the process.
  */
 public class Options extends RocksObject
-    implements DBOptionsInterface<Options>, ColumnFamilyOptionsInterface<Options>,
+    implements DBOptionsInterface<Options>,
+    MutableDBOptionsInterface<Options>,
+    ColumnFamilyOptionsInterface<Options>,
     MutableColumnFamilyOptionsInterface<Options> {
   static {
     RocksDB.loadLibrary();
@@ -49,6 +51,30 @@ public class Options extends RocksObject
     super(newOptions(dbOptions.nativeHandle_,
         columnFamilyOptions.nativeHandle_));
     env_ = Env.getDefault();
+  }
+
+  /**
+   * Copy constructor for ColumnFamilyOptions.
+   *
+   * NOTE: This does a shallow copy, which means comparator, merge_operator
+   * and other pointers will be cloned!
+   *
+   * @param other The Options to copy.
+   */
+  public Options(Options other) {
+    super(copyOptions(other.nativeHandle_));
+    this.env_ = other.env_;
+    this.memTableConfig_ = other.memTableConfig_;
+    this.tableFormatConfig_ = other.tableFormatConfig_;
+    this.rateLimiter_ = other.rateLimiter_;
+    this.comparator_ = other.comparator_;
+    this.compactionFilter_ = other.compactionFilter_;
+    this.compactionFilterFactory_ = other.compactionFilterFactory_;
+    this.compactionOptionsUniversal_ = other.compactionOptionsUniversal_;
+    this.compactionOptionsFIFO_ = other.compactionOptionsFIFO_;
+    this.compressionOptions_ = other.compressionOptions_;
+    this.rowCache_ = other.rowCache_;
+    this.writeBufferManager_ = other.writeBufferManager_;
   }
 
   @Override
@@ -169,7 +195,8 @@ public class Options extends RocksObject
   public Options setComparator(
       final AbstractComparator<? extends AbstractSlice<?>> comparator) {
     assert(isOwningHandle());
-    setComparatorHandle(nativeHandle_, comparator.getNativeHandle());
+    setComparatorHandle(nativeHandle_, comparator.nativeHandle_,
+            comparator.getComparatorType().getValue());
     comparator_ = comparator;
     return this;
   }
@@ -189,6 +216,35 @@ public class Options extends RocksObject
   public Options setMergeOperator(final MergeOperator mergeOperator) {
     setMergeOperator(nativeHandle_, mergeOperator.nativeHandle_);
     return this;
+  }
+
+  @Override
+  public Options setCompactionFilter(
+          final AbstractCompactionFilter<? extends AbstractSlice<?>>
+                  compactionFilter) {
+    setCompactionFilterHandle(nativeHandle_, compactionFilter.nativeHandle_);
+    compactionFilter_ = compactionFilter;
+    return this;
+  }
+
+  @Override
+  public AbstractCompactionFilter<? extends AbstractSlice<?>> compactionFilter() {
+    assert (isOwningHandle());
+    return compactionFilter_;
+  }
+
+  @Override
+  public Options setCompactionFilterFactory(final AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>> compactionFilterFactory) {
+    assert (isOwningHandle());
+    setCompactionFilterFactoryHandle(nativeHandle_, compactionFilterFactory.nativeHandle_);
+    compactionFilterFactory_ = compactionFilterFactory;
+    return this;
+  }
+
+  @Override
+  public AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>> compactionFilterFactory() {
+    assert (isOwningHandle());
+    return compactionFilterFactory_;
   }
 
   @Override
@@ -418,9 +474,10 @@ public class Options extends RocksObject
   }
 
   @Override
-  public void setMaxSubcompactions(final int maxSubcompactions) {
+  public Options setMaxSubcompactions(final int maxSubcompactions) {
     assert(isOwningHandle());
     setMaxSubcompactions(nativeHandle_, maxSubcompactions);
+    return this;
   }
 
   @Override
@@ -702,6 +759,20 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setWriteBufferManager(final WriteBufferManager writeBufferManager) {
+    assert(isOwningHandle());
+    setWriteBufferManager(nativeHandle_, writeBufferManager.nativeHandle_);
+    this.writeBufferManager_ = writeBufferManager;
+    return this;
+  }
+
+  @Override
+  public WriteBufferManager writeBufferManager() {
+    assert(isOwningHandle());
+    return this.writeBufferManager_;
+  }
+
+    @Override
   public long dbWriteBufferSize() {
     assert(isOwningHandle());
     return dbWriteBufferSize(nativeHandle_);
@@ -838,6 +909,28 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setEnablePipelinedWrite(final boolean enablePipelinedWrite) {
+    setEnablePipelinedWrite(nativeHandle_, enablePipelinedWrite);
+    return this;
+  }
+
+  @Override
+  public boolean enablePipelinedWrite() {
+    return enablePipelinedWrite(nativeHandle_);
+  }
+
+  @Override
+  public Options setUnorderedWrite(final boolean unorderedWrite) {
+    setUnorderedWrite(nativeHandle_, unorderedWrite);
+    return this;
+  }
+
+  @Override
+  public boolean unorderedWrite() {
+    return unorderedWrite(nativeHandle_);
+  }
+
+  @Override
   public Options setAllowConcurrentMemtableWrite(
       final boolean allowConcurrentMemtableWrite) {
     setAllowConcurrentMemtableWrite(nativeHandle_,
@@ -939,6 +1032,20 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setWalFilter(final AbstractWalFilter walFilter) {
+    assert(isOwningHandle());
+    setWalFilter(nativeHandle_, walFilter.nativeHandle_);
+    this.walFilter_ = walFilter;
+    return this;
+  }
+
+  @Override
+  public WalFilter walFilter() {
+    assert(isOwningHandle());
+    return this.walFilter_;
+  }
+
+  @Override
   public Options setFailIfOptionsFileError(final boolean failIfOptionsFileError) {
     assert(isOwningHandle());
     setFailIfOptionsFileError(nativeHandle_, failIfOptionsFileError);
@@ -991,6 +1098,58 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setAllowIngestBehind(final boolean allowIngestBehind) {
+    assert(isOwningHandle());
+    setAllowIngestBehind(nativeHandle_, allowIngestBehind);
+    return this;
+  }
+
+  @Override
+  public boolean allowIngestBehind() {
+    assert(isOwningHandle());
+    return allowIngestBehind(nativeHandle_);
+  }
+
+  @Override
+  public Options setPreserveDeletes(final boolean preserveDeletes) {
+    assert(isOwningHandle());
+    setPreserveDeletes(nativeHandle_, preserveDeletes);
+    return this;
+  }
+
+  @Override
+  public boolean preserveDeletes() {
+    assert(isOwningHandle());
+    return preserveDeletes(nativeHandle_);
+  }
+
+  @Override
+  public Options setTwoWriteQueues(final boolean twoWriteQueues) {
+    assert(isOwningHandle());
+    setTwoWriteQueues(nativeHandle_, twoWriteQueues);
+    return this;
+  }
+
+  @Override
+  public boolean twoWriteQueues() {
+    assert(isOwningHandle());
+    return twoWriteQueues(nativeHandle_);
+  }
+
+  @Override
+  public Options setManualWalFlush(final boolean manualWalFlush) {
+    assert(isOwningHandle());
+    setManualWalFlush(nativeHandle_, manualWalFlush);
+    return this;
+  }
+
+  @Override
+  public boolean manualWalFlush() {
+    assert(isOwningHandle());
+    return manualWalFlush(nativeHandle_);
+  }
+
+  @Override
   public MemTableConfig memTableConfig() {
     return this.memTableConfig_;
   }
@@ -1007,6 +1166,13 @@ public class Options extends RocksObject
     assert(isOwningHandle());
     rateLimiter_ = rateLimiter;
     setRateLimiter(nativeHandle_, rateLimiter.nativeHandle_);
+    return this;
+  }
+
+  @Override
+  public Options setSstFileManager(final SstFileManager sstFileManager) {
+    assert(isOwningHandle());
+    setSstFileManager(nativeHandle_, sstFileManager.nativeHandle_);
     return this;
   }
 
@@ -1120,6 +1286,20 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setBottommostCompressionOptions(
+      final CompressionOptions bottommostCompressionOptions) {
+    setBottommostCompressionOptions(nativeHandle_,
+        bottommostCompressionOptions.nativeHandle_);
+    this.bottommostCompressionOptions_ = bottommostCompressionOptions;
+    return this;
+  }
+
+  @Override
+  public CompressionOptions bottommostCompressionOptions() {
+    return this.bottommostCompressionOptions_;
+  }
+
+  @Override
   public Options setCompressionOptions(
       final CompressionOptions compressionOptions) {
     setCompressionOptions(nativeHandle_, compressionOptions.nativeHandle_);
@@ -1134,7 +1314,7 @@ public class Options extends RocksObject
 
   @Override
   public CompactionStyle compactionStyle() {
-    return CompactionStyle.values()[compactionStyle(nativeHandle_)];
+    return CompactionStyle.fromValue(compactionStyle(nativeHandle_));
   }
 
   @Override
@@ -1507,6 +1687,17 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setTtl(final long ttl) {
+    setTtl(nativeHandle_, ttl);
+    return this;
+  }
+
+  @Override
+  public long ttl() {
+    return ttl(nativeHandle_);
+  }
+
+  @Override
   public Options setCompactionOptionsUniversal(
       final CompactionOptionsUniversal compactionOptionsUniversal) {
     setCompactionOptionsUniversal(nativeHandle_,
@@ -1544,9 +1735,21 @@ public class Options extends RocksObject
     return forceConsistencyChecks(nativeHandle_);
   }
 
+  @Override
+  public Options setAtomicFlush(final boolean atomicFlush) {
+    setAtomicFlush(nativeHandle_, atomicFlush);
+    return this;
+  }
+
+  @Override
+  public boolean atomicFlush() {
+    return atomicFlush(nativeHandle_);
+  }
+
   private native static long newOptions();
   private native static long newOptions(long dbOptHandle,
       long cfOptHandle);
+  private native static long copyOptions(long handle);
   @Override protected final native void disposeInternal(final long handle);
   private native void setEnv(long optHandle, long envHandle);
   private native void prepareForBulkLoad(long handle);
@@ -1565,6 +1768,8 @@ public class Options extends RocksObject
   private native boolean paranoidChecks(long handle);
   private native void setRateLimiter(long handle,
       long rateLimiterHandle);
+  private native void setSstFileManager(final long handle,
+      final long sstFileManagerHandle);
   private native void setLogger(long handle,
       long loggerHandle);
   private native void setInfoLogLevel(long handle, byte logLevel);
@@ -1658,6 +1863,8 @@ public class Options extends RocksObject
   private native boolean adviseRandomOnOpen(long handle);
   private native void setDbWriteBufferSize(final long handle,
       final long dbWriteBufferSize);
+  private native void setWriteBufferManager(final long handle,
+      final long writeBufferManagerHandle);
   private native long dbWriteBufferSize(final long handle);
   private native void setAccessHintOnCompactionStart(final long handle,
       final byte accessHintOnCompactionStart);
@@ -1687,6 +1894,12 @@ public class Options extends RocksObject
   private native boolean enableThreadTracking(long handle);
   private native void setDelayedWriteRate(long handle, long delayedWriteRate);
   private native long delayedWriteRate(long handle);
+  private native void setEnablePipelinedWrite(final long handle,
+      final boolean pipelinedWrite);
+  private native boolean enablePipelinedWrite(final long handle);
+  private native void setUnorderedWrite(final long handle,
+      final boolean unorderedWrite);
+  private native boolean unorderedWrite(final long handle);
   private native void setAllowConcurrentMemtableWrite(long handle,
       boolean allowConcurrentMemtableWrite);
   private native boolean allowConcurrentMemtableWrite(long handle);
@@ -1709,7 +1922,9 @@ public class Options extends RocksObject
       final boolean allow2pc);
   private native boolean allow2pc(final long handle);
   private native void setRowCache(final long handle,
-      final long row_cache_handle);
+      final long rowCacheHandle);
+  private native void setWalFilter(final long handle,
+      final long walFilterHandle);
   private native void setFailIfOptionsFileError(final long handle,
       final boolean failIfOptionsFileError);
   private native boolean failIfOptionsFileError(final long handle);
@@ -1722,6 +1937,19 @@ public class Options extends RocksObject
   private native void setAvoidFlushDuringShutdown(final long handle,
       final boolean avoidFlushDuringShutdown);
   private native boolean avoidFlushDuringShutdown(final long handle);
+  private native void setAllowIngestBehind(final long handle,
+      final boolean allowIngestBehind);
+  private native boolean allowIngestBehind(final long handle);
+  private native void setPreserveDeletes(final long handle,
+      final boolean preserveDeletes);
+  private native boolean preserveDeletes(final long handle);
+  private native void setTwoWriteQueues(final long handle,
+      final boolean twoWriteQueues);
+  private native boolean twoWriteQueues(final long handle);
+  private native void setManualWalFlush(final long handle,
+      final boolean manualWalFlush);
+  private native boolean manualWalFlush(final long handle);
+
 
   // CF native handles
   private native void optimizeForSmallDb(final long handle);
@@ -1733,11 +1961,15 @@ public class Options extends RocksObject
       long memtableMemoryBudget);
   private native void setComparatorHandle(long handle, int builtinComparator);
   private native void setComparatorHandle(long optHandle,
-      long comparatorHandle);
+      long comparatorHandle, byte comparatorType);
   private native void setMergeOperatorName(
       long handle, String name);
   private native void setMergeOperator(
       long handle, long mergeOperatorHandle);
+  private native void setCompactionFilterHandle(
+          long handle, long compactionFilterHandle);
+  private native void setCompactionFilterFactoryHandle(
+          long handle, long compactionFilterFactoryHandle);
   private native void setWriteBufferSize(long handle, long writeBufferSize)
       throws IllegalArgumentException;
   private native long writeBufferSize(long handle);
@@ -1755,6 +1987,8 @@ public class Options extends RocksObject
   private native void setBottommostCompressionType(long handle,
       byte bottommostCompressionType);
   private native byte bottommostCompressionType(long handle);
+  private native void setBottommostCompressionOptions(final long handle,
+      final long bottommostCompressionOptionsHandle);
   private native void setCompressionOptions(long handle,
       long compressionOptionsHandle);
   private native void useFixedLengthPrefixExtractor(
@@ -1858,6 +2092,8 @@ public class Options extends RocksObject
   private native void setReportBgIoStats(final long handle,
       final boolean reportBgIoStats);
   private native boolean reportBgIoStats(final long handle);
+  private native void setTtl(final long handle, final long ttl);
+  private native long ttl(final long handle);
   private native void setCompactionOptionsUniversal(final long handle,
       final long compactionOptionsUniversalHandle);
   private native void setCompactionOptionsFIFO(final long handle,
@@ -1865,15 +2101,25 @@ public class Options extends RocksObject
   private native void setForceConsistencyChecks(final long handle,
       final boolean forceConsistencyChecks);
   private native boolean forceConsistencyChecks(final long handle);
+  private native void setAtomicFlush(final long handle,
+      final boolean atomicFlush);
+  private native boolean atomicFlush(final long handle);
 
   // instance variables
+  // NOTE: If you add new member variables, please update the copy constructor above!
   private Env env_;
   private MemTableConfig memTableConfig_;
   private TableFormatConfig tableFormatConfig_;
   private RateLimiter rateLimiter_;
   private AbstractComparator<? extends AbstractSlice<?>> comparator_;
+  private AbstractCompactionFilter<? extends AbstractSlice<?>> compactionFilter_;
+  private AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+          compactionFilterFactory_;
   private CompactionOptionsUniversal compactionOptionsUniversal_;
   private CompactionOptionsFIFO compactionOptionsFIFO_;
+  private CompressionOptions bottommostCompressionOptions_;
   private CompressionOptions compressionOptions_;
   private Cache rowCache_;
+  private WalFilter walFilter_;
+  private WriteBufferManager writeBufferManager_;
 }

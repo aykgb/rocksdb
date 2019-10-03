@@ -8,7 +8,7 @@
 
 #include "rocksdb/convenience.h"
 
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "util/cast_util.h"
 
 namespace rocksdb {
@@ -19,15 +19,29 @@ void CancelAllBackgroundWork(DB* db, bool wait) {
 }
 
 Status DeleteFilesInRange(DB* db, ColumnFamilyHandle* column_family,
-                          const Slice* begin, const Slice* end) {
+                          const Slice* begin, const Slice* end,
+                          bool include_end) {
+  RangePtr range(begin, end);
+  return DeleteFilesInRanges(db, column_family, &range, 1, include_end);
+}
+
+Status DeleteFilesInRanges(DB* db, ColumnFamilyHandle* column_family,
+                           const RangePtr* ranges, size_t n,
+                           bool include_end) {
   return (static_cast_with_check<DBImpl, DB>(db->GetRootDB()))
-      ->DeleteFilesInRange(column_family, begin, end);
+      ->DeleteFilesInRanges(column_family, ranges, n, include_end);
 }
 
 Status VerifySstFileChecksum(const Options& options,
                              const EnvOptions& env_options,
                              const std::string& file_path) {
-  unique_ptr<RandomAccessFile> file;
+  return VerifySstFileChecksum(options, env_options, ReadOptions(), file_path);
+}
+Status VerifySstFileChecksum(const Options& options,
+                             const EnvOptions& env_options,
+                             const ReadOptions& read_options,
+                             const std::string& file_path) {
+  std::unique_ptr<RandomAccessFile> file;
   uint64_t file_size;
   InternalKeyComparator internal_comparator(options.comparator);
   ImmutableCFOptions ioptions(options);
@@ -38,18 +52,21 @@ Status VerifySstFileChecksum(const Options& options,
   } else {
     return s;
   }
-  unique_ptr<TableReader> table_reader;
+  std::unique_ptr<TableReader> table_reader;
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(std::move(file), file_path));
+  const bool kImmortal = true;
   s = ioptions.table_factory->NewTableReader(
-      TableReaderOptions(ioptions, env_options, internal_comparator,
-                         false /* skip_filters */, -1 /* level */),
+      TableReaderOptions(ioptions, options.prefix_extractor.get(), env_options,
+                         internal_comparator, false /* skip_filters */,
+                         !kImmortal, -1 /* level */),
       std::move(file_reader), file_size, &table_reader,
       false /* prefetch_index_and_filter_in_cache */);
   if (!s.ok()) {
     return s;
   }
-  s = table_reader->VerifyChecksum();
+  s = table_reader->VerifyChecksum(read_options,
+                                   TableReaderCaller::kUserVerifyChecksum);
   return s;
 }
 

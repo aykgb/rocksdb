@@ -7,16 +7,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef __STDC_FORMAT_MACROS
-#define __STDC_FORMAT_MACROS
-#endif
-
 #include "monitoring/histogram.h"
 
-#include <inttypes.h>
-#include <cassert>
 #include <math.h>
 #include <stdio.h>
+#include <cassert>
+#include <cinttypes>
 
 #include "port/port.h"
 #include "util/cast_util.h"
@@ -202,6 +198,7 @@ std::string HistogramStat::ToString() const {
            Percentile(99.99));
   r.append(buf);
   r.append("------------------------------------------------------\n");
+  if (cur_num == 0) return r;   // all buckets are empty
   const double mult = 100.0 / cur_num;
   uint64_t cumulative_sum = 0;
   for (unsigned int b = 0; b < num_buckets_; b++) {
@@ -234,6 +231,9 @@ void HistogramStat::Data(HistogramData * const data) const {
   data->max = static_cast<double>(max());
   data->average = Average();
   data->standard_deviation = StandardDeviation();
+  data->count = num();
+  data->sum = sum();
+  data->min = static_cast<double>(min());
 }
 
 void HistogramImpl::Clear() {

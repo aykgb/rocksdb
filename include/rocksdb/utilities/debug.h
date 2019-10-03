@@ -16,6 +16,8 @@ namespace rocksdb {
 // store multiple versions of a same user key due to snapshots, compaction not
 // happening yet, etc.
 struct KeyVersion {
+  KeyVersion() : user_key(""), value(""), sequence(0), type(0) {}
+
   KeyVersion(const std::string& _user_key, const std::string& _value,
              SequenceNumber _sequence, int _type)
       : user_key(_user_key), value(_value), sequence(_sequence), type(_type) {}
@@ -29,9 +31,17 @@ struct KeyVersion {
 };
 
 // Returns listing of all versions of keys in the provided user key range.
-// The range is inclusive-inclusive, i.e., [`begin_key`, `end_key`].
+// The range is inclusive-inclusive, i.e., [`begin_key`, `end_key`], or
+// `max_num_ikeys` has been reached. Since all those keys returned will be
+// copied to memory, if the range covers too many keys, the memory usage
+// may be huge. `max_num_ikeys` can be used to cap the memory usage.
 // The result is inserted into the provided vector, `key_versions`.
 Status GetAllKeyVersions(DB* db, Slice begin_key, Slice end_key,
+                         size_t max_num_ikeys,
+                         std::vector<KeyVersion>* key_versions);
+
+Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, Slice begin_key,
+                         Slice end_key, size_t max_num_ikeys,
                          std::vector<KeyVersion>* key_versions);
 
 }  // namespace rocksdb

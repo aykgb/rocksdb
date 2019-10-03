@@ -7,21 +7,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef __STDC_FORMAT_MACROS
-#define __STDC_FORMAT_MACROS
-#endif
-
 #include <cstring>
 
-#include "options/options_parser.h"
+#include "options/options_helper.h"
 #include "rocksdb/convenience.h"
-#include "util/testharness.h"
+#include "test_util/testharness.h"
 
 #ifndef GFLAGS
 bool FLAGS_enable_print = false;
 #else
-#include <gflags/gflags.h>
-using GFLAGS::ParseCommandLineFlags;
+#include "util/gflags_compat.h"
+using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 DEFINE_bool(enable_print, false, "Print options generated to console.");
 #endif  // GFLAGS
 
@@ -140,7 +136,11 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "cache_index_and_filter_blocks=1;"
       "cache_index_and_filter_blocks_with_high_priority=true;"
       "pin_l0_filter_and_index_blocks_in_cache=1;"
+      "pin_top_level_index_and_filter=1;"
       "index_type=kHashSearch;"
+      "data_block_index_type=kDataBlockBinaryAndHash;"
+      "index_shortening=kNoShortening;"
+      "data_block_hash_table_util_ratio=0.75;"
       "checksum=kxxHash;hash_index_allow_collision=1;no_block_cache=1;"
       "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
       "block_size_deviation=8;block_restart_interval=4; "
@@ -150,7 +150,9 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "filter_policy=bloomfilter:4:true;whole_key_filtering=1;"
       "format_version=1;"
       "hash_index_allow_collision=false;"
-      "verify_compression=true;read_amp_bytes_per_bit=0",
+      "verify_compression=true;read_amp_bytes_per_bit=0;"
+      "enable_index_compression=false;"
+      "block_align=true",
       new_bbto));
 
   ASSERT_EQ(unset_bytes_base,
@@ -227,6 +229,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "delete_obsolete_files_period_micros=4294967758;"
                              "WAL_ttl_seconds=4295008036;"
                              "WAL_size_limit_MB=4295036161;"
+                             "max_write_batch_group_size_bytes=1048576;"
                              "wal_dir=path/to/wal_dir;"
                              "db_write_buffer_size=2587;"
                              "max_subcompactions=64330;"
@@ -250,6 +253,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "paranoid_checks=true;"
                              "is_fd_close_on_exec=false;"
                              "bytes_per_sync=4295013613;"
+                             "strict_bytes_per_sync=true;"
                              "enable_thread_tracking=false;"
                              "recycle_log_file_num=0;"
                              "create_missing_column_families=true;"
@@ -261,6 +265,9 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "manifest_preallocation_size=1222;"
                              "allow_mmap_writes=false;"
                              "stats_dump_period_sec=70127;"
+                             "stats_persist_period_sec=54321;"
+                             "persist_stats_to_disk=true;"
+                             "stats_history_buffer_size=14159;"
                              "allow_fallocate=true;"
                              "allow_mmap_reads=false;"
                              "use_direct_reads=false;"
@@ -270,6 +277,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "advise_random_on_open=true;"
                              "fail_if_options_file_error=false;"
                              "enable_pipelined_write=false;"
+                             "unordered_write=false;"
                              "allow_concurrent_memtable_write=true;"
                              "wal_recovery_mode=kPointInTimeRecovery;"
                              "enable_write_thread_adaptive_yield=true;"
@@ -282,9 +290,15 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "avoid_flush_during_recovery=false;"
                              "avoid_flush_during_shutdown=false;"
                              "allow_ingest_behind=false;"
+                             "preserve_deletes=false;"
                              "concurrent_prepare=false;"
+                             "two_write_queues=false;"
                              "manual_wal_flush=false;"
-                             "seq_per_batch=false;",
+                             "seq_per_batch=false;"
+                             "atomic_flush=false;"
+                             "avoid_unnecessary_blocking_io=false;"
+                             "log_readahead_size=0;"
+                             "write_dbid_to_manifest=false",
                              new_options));
 
   ASSERT_EQ(unset_bytes_base, NumUnsetBytes(new_options_ptr, sizeof(DBOptions),
@@ -295,6 +309,12 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
 
   delete[] options_ptr;
   delete[] new_options_ptr;
+}
+
+template <typename T1, typename T2>
+inline int offset_of(T1 T2::*member) {
+  static T2 obj;
+  return int(size_t(&(obj.*member)) - size_t(&obj));
 }
 
 // If the test fails, likely a new option is added to ColumnFamilyOptions
@@ -333,8 +353,12 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
        sizeof(std::shared_ptr<CompactionFilterFactory>)},
       {offset_of(&ColumnFamilyOptions::prefix_extractor),
        sizeof(std::shared_ptr<const SliceTransform>)},
+      {offset_of(&ColumnFamilyOptions::snap_refresh_nanos), sizeof(uint64_t)},
       {offset_of(&ColumnFamilyOptions::table_factory),
        sizeof(std::shared_ptr<TableFactory>)},
+      {offset_of(&ColumnFamilyOptions::cf_paths), sizeof(std::vector<DbPath>)},
+      {offset_of(&ColumnFamilyOptions::compaction_thread_limiter),
+       sizeof(std::shared_ptr<ConcurrentTaskLimiter>)},
   };
 
   char* options_ptr = new char[sizeof(ColumnFamilyOptions)];
@@ -368,11 +392,12 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
   options->rate_limit_delay_max_milliseconds = 33;
   options->compaction_options_universal = CompactionOptionsUniversal();
   options->compression_opts = CompressionOptions();
+  options->bottommost_compression_opts = CompressionOptions();
   options->hard_rate_limit = 0;
   options->soft_rate_limit = 0;
   options->purge_redundant_kvs_while_flush = false;
-  options->compaction_options_fifo = CompactionOptionsFIFO();
   options->max_mem_compaction_level = 0;
+  options->compaction_filter = nullptr;
 
   char* new_options_ptr = new char[sizeof(ColumnFamilyOptions)];
   ColumnFamilyOptions* new_options =
@@ -414,8 +439,10 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "soft_rate_limit=530.615385;"
       "soft_pending_compaction_bytes_limit=0;"
       "max_write_buffer_number_to_maintain=84;"
+      "max_write_buffer_size_to_maintain=2147483648;"
       "merge_operator=aabcxehazrMergeOperator;"
       "memtable_prefix_bloom_size_ratio=0.4642;"
+      "memtable_whole_key_filtering=true;"
       "memtable_insert_with_hint_prefix_extractor=rocksdb.CappedPrefix.13;"
       "paranoid_file_checks=true;"
       "force_consistency_checks=true;"
@@ -427,7 +454,12 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "compaction_pri=kMinOverlappingRatio;"
       "hard_pending_compaction_bytes_limit=0;"
       "disable_auto_compactions=false;"
-      "report_bg_io_stats=true;",
+      "report_bg_io_stats=true;"
+      "ttl=60;"
+      "periodic_compaction_seconds=3600;"
+      "sample_for_compression=0;"
+      "compaction_options_fifo={max_table_files_size=3;allow_"
+      "compaction=false;};",
       new_options));
 
   ASSERT_EQ(unset_bytes_base,

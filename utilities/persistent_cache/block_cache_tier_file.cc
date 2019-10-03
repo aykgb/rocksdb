@@ -13,9 +13,9 @@
 #include <memory>
 #include <vector>
 
+#include "logging/logging.h"
 #include "port/port.h"
 #include "util/crc32c.h"
-#include "util/logging.h"
 
 namespace rocksdb {
 
@@ -34,6 +34,8 @@ Status NewWritableCacheFile(Env* const env, const std::string& filepath,
 Status NewRandomAccessCacheFile(Env* const env, const std::string& filepath,
                                 std::unique_ptr<RandomAccessFile>* file,
                                 const bool use_direct_reads = true) {
+  assert(env);
+
   EnvOptions opt;
   opt.use_direct_reads = use_direct_reads;
   Status s = env->NewRandomAccessFile(filepath, file, opt);
@@ -44,6 +46,8 @@ Status NewRandomAccessCacheFile(Env* const env, const std::string& filepath,
 // BlockCacheFile
 //
 Status BlockCacheFile::Delete(uint64_t* size) {
+  assert(env_);
+
   Status status = env_->GetFileSize(Path(), size);
   if (!status.ok()) {
     return status;
@@ -62,7 +66,8 @@ Status BlockCacheFile::Delete(uint64_t* size) {
 // <-- 4 --><-- 4  --><-- 4   --><-- 4     --><-- key size  --><-- v-size -->
 //
 struct CacheRecordHeader {
-  CacheRecordHeader() {}
+  CacheRecordHeader()
+    : magic_(0), crc_(0), key_size_(0), val_size_(0) {}
   CacheRecordHeader(const uint32_t magic, const uint32_t key_size,
                     const uint32_t val_size)
       : magic_(magic), crc_(0), key_size_(key_size), val_size_(val_size) {}
@@ -277,7 +282,7 @@ WriteableCacheFile::~WriteableCacheFile() {
   ClearBuffers();
 }
 
-bool WriteableCacheFile::Create(const bool enable_direct_writes,
+bool WriteableCacheFile::Create(const bool /*enable_direct_writes*/,
                                 const bool enable_direct_reads) {
   WriteLock _(&rwlock_);
 
@@ -285,6 +290,8 @@ bool WriteableCacheFile::Create(const bool enable_direct_writes,
 
   ROCKS_LOG_DEBUG(log_, "Creating new cache %s (max size is %d B)",
                   Path().c_str(), max_size_);
+
+  assert(env_);
 
   Status s = env_->FileExists(Path());
   if (s.ok()) {
@@ -358,6 +365,8 @@ bool WriteableCacheFile::ExpandBuffer(const size_t size) {
 
   // expand the buffer until there is enough space to write `size` bytes
   assert(free < size);
+  assert(alloc_);
+
   while (free < size) {
     CacheWriteBuffer* const buf = alloc_->Allocate();
     if (!buf) {
@@ -393,6 +402,7 @@ void WriteableCacheFile::DispatchBuffer() {
   assert(eof_ || buf_doff_ < buf_woff_);
   assert(buf_doff_ < bufs_.size());
   assert(file_);
+  assert(alloc_);
 
   auto* buf = bufs_[buf_doff_];
   const uint64_t file_off = buf_doff_ * alloc_->BufferSize();
@@ -452,6 +462,7 @@ bool WriteableCacheFile::ReadBuffer(const LBA& lba, char* data) {
   rwlock_.AssertHeld();
 
   assert(lba.off_ < disk_woff_);
+  assert(alloc_);
 
   // we read from the buffers like reading from a flat file. The list of buffers
   // are treated as contiguous stream of data
@@ -510,6 +521,8 @@ void WriteableCacheFile::Close() {
 }
 
 void WriteableCacheFile::ClearBuffers() {
+  assert(alloc_);
+
   for (size_t i = 0; i < bufs_.size(); ++i) {
     alloc_->Deallocate(bufs_[i]);
   }

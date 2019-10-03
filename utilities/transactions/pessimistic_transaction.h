@@ -38,7 +38,11 @@ class PessimisticTransactionDB;
 class PessimisticTransaction : public TransactionBaseImpl {
  public:
   PessimisticTransaction(TransactionDB* db, const WriteOptions& write_options,
-                         const TransactionOptions& txn_options);
+                         const TransactionOptions& txn_options,
+                         const bool init = true);
+  // No copying allowed
+  PessimisticTransaction(const PessimisticTransaction&) = delete;
+  void operator=(const PessimisticTransaction&) = delete;
 
   virtual ~PessimisticTransaction();
 
@@ -54,7 +58,7 @@ class PessimisticTransaction : public TransactionBaseImpl {
   // transactions writes to an internal write batch.
   Status CommitBatch(WriteBatch* batch);
 
-  Status Rollback() override = 0;
+  Status Rollback() override;
 
   Status RollbackToSavePoint() override;
 
@@ -113,21 +117,30 @@ class PessimisticTransaction : public TransactionBaseImpl {
   int64_t GetDeadlockDetectDepth() const { return deadlock_detect_depth_; }
 
  protected:
+  // Refer to
+  // TransactionOptions::use_only_the_last_commit_time_batch_for_recovery
+  bool use_only_the_last_commit_time_batch_for_recovery_ = false;
+
   virtual Status PrepareInternal() = 0;
 
   virtual Status CommitWithoutPrepareInternal() = 0;
 
-  virtual Status CommitBatchInternal(WriteBatch* batch) = 0;
+  // batch_cnt if non-zero is the number of sub-batches. A sub-batch is a batch
+  // with no duplicate keys. If zero, then the number of sub-batches is unknown.
+  virtual Status CommitBatchInternal(WriteBatch* batch,
+                                     size_t batch_cnt = 0) = 0;
 
   virtual Status CommitInternal() = 0;
 
-  void Initialize(const TransactionOptions& txn_options);
+  virtual Status RollbackInternal() = 0;
+
+  virtual void Initialize(const TransactionOptions& txn_options);
 
   Status LockBatch(WriteBatch* batch, TransactionKeyMap* keys_to_unlock);
 
   Status TryLock(ColumnFamilyHandle* column_family, const Slice& key,
-                 bool read_only, bool exclusive,
-                 bool untracked = false) override;
+                 bool read_only, bool exclusive, const bool do_validate = true,
+                 const bool assume_tracked = false) override;
 
   void Clear() override;
 
@@ -139,6 +152,7 @@ class PessimisticTransaction : public TransactionBaseImpl {
   uint64_t expiration_time_;
 
  private:
+  friend class TransactionTest_ValidateSnapshotTest_Test;
   // Used to create unique ids for transactions.
   static std::atomic<TransactionID> txn_id_counter_;
 
@@ -173,41 +187,37 @@ class PessimisticTransaction : public TransactionBaseImpl {
   // Whether to perform deadlock detection or not.
   int64_t deadlock_detect_depth_;
 
-  Status ValidateSnapshot(ColumnFamilyHandle* column_family, const Slice& key,
-                          SequenceNumber prev_seqno, SequenceNumber* new_seqno);
+  // Refer to TransactionOptions::skip_concurrency_control
+  bool skip_concurrency_control_;
+
+  virtual Status ValidateSnapshot(ColumnFamilyHandle* column_family,
+                                  const Slice& key,
+                                  SequenceNumber* tracked_at_seq);
 
   void UnlockGetForUpdate(ColumnFamilyHandle* column_family,
                           const Slice& key) override;
-
-  // No copying allowed
-  PessimisticTransaction(const PessimisticTransaction&);
-  void operator=(const PessimisticTransaction&);
 };
 
 class WriteCommittedTxn : public PessimisticTransaction {
  public:
   WriteCommittedTxn(TransactionDB* db, const WriteOptions& write_options,
                     const TransactionOptions& txn_options);
+  // No copying allowed
+  WriteCommittedTxn(const WriteCommittedTxn&) = delete;
+  void operator=(const WriteCommittedTxn&) = delete;
 
   virtual ~WriteCommittedTxn() {}
-
-  Status Rollback() override;
 
  private:
   Status PrepareInternal() override;
 
   Status CommitWithoutPrepareInternal() override;
 
-  Status CommitBatchInternal(WriteBatch* batch) override;
+  Status CommitBatchInternal(WriteBatch* batch, size_t batch_cnt) override;
 
   Status CommitInternal() override;
 
-  Status ValidateSnapshot(ColumnFamilyHandle* column_family, const Slice& key,
-                          SequenceNumber prev_seqno, SequenceNumber* new_seqno);
-
-  // No copying allowed
-  WriteCommittedTxn(const WriteCommittedTxn&);
-  void operator=(const WriteCommittedTxn&);
+  Status RollbackInternal() override;
 };
 
 }  // namespace rocksdb

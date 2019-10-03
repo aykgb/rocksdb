@@ -7,12 +7,12 @@
 #include <atomic>
 #include <string>
 
-#include "rocksdb/env.h"
 #include "port/port.h"
+#include "rocksdb/env.h"
+#include "test_util/sync_point.h"
+#include "test_util/testharness.h"
+#include "test_util/testutil.h"
 #include "util/autovector.h"
-#include "util/sync_point.h"
-#include "util/testharness.h"
-#include "util/testutil.h"
 #include "util/thread_local.h"
 
 namespace rocksdb {
@@ -535,7 +535,7 @@ TEST_F(ThreadLocalTest, CompareAndSwap) {
 
 namespace {
 
-void* AccessThreadLocal(void* arg) {
+void* AccessThreadLocal(void* /*arg*/) {
   TEST_SYNC_POINT("AccessThreadLocal:Start");
   ThreadLocalPtr tlp;
   tlp.Reset(new std::string("hello RocksDB"));

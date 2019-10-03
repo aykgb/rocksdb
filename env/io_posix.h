@@ -41,6 +41,9 @@ static Status IOError(const std::string& context, const std::string& file_name,
                            strerror(err_number));
   case ESTALE:
     return Status::IOError(Status::kStaleFile);
+  case ENOENT:
+    return Status::PathNotFound(IOErrorMsg(context, file_name),
+                                strerror(err_number));
   default:
     return Status::IOError(IOErrorMsg(context, file_name),
                            strerror(err_number));
@@ -115,6 +118,11 @@ class PosixWritableFile : public WritableFile {
   bool allow_fallocate_;
   bool fallocate_with_keep_size_;
 #endif
+#ifdef ROCKSDB_RANGESYNC_PRESENT
+  // Even if the syscall is present, the filesystem may still not properly
+  // support it, so we need to do a dynamic check too.
+  bool sync_file_range_supported_;
+#endif  // ROCKSDB_RANGESYNC_PRESENT
 
  public:
   explicit PosixWritableFile(const std::string& fname, int fd,
@@ -132,6 +140,7 @@ class PosixWritableFile : public WritableFile {
   virtual Status Fsync() override;
   virtual bool IsSyncThreadSafe() const override;
   virtual bool use_direct_io() const override { return use_direct_io_; }
+  virtual void SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) override;
   virtual uint64_t GetFileSize() override;
   virtual Status InvalidateCache(size_t offset, size_t length) override;
   virtual size_t GetRequiredBufferAlignment() const override {
@@ -140,9 +149,7 @@ class PosixWritableFile : public WritableFile {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   virtual Status Allocate(uint64_t offset, uint64_t len) override;
 #endif
-#ifdef ROCKSDB_RANGESYNC_PRESENT
   virtual Status RangeSync(uint64_t offset, uint64_t nbytes) override;
-#endif
 #ifdef OS_LINUX
   virtual size_t GetUniqueId(char* id, size_t max_size) const override;
 #endif
@@ -201,7 +208,7 @@ class PosixMmapFile : public WritableFile {
 
   // Means Close() will properly take care of truncate
   // and it does not need any additional information
-  virtual Status Truncate(uint64_t size) override { return Status::OK(); }
+  virtual Status Truncate(uint64_t /*size*/) override { return Status::OK(); }
   virtual Status Close() override;
   virtual Status Append(const Slice& data) override;
   virtual Status Flush() override;
@@ -233,6 +240,12 @@ class PosixRandomRWFile : public RandomRWFile {
  private:
   const std::string filename_;
   int fd_;
+};
+
+struct PosixMemoryMappedFileBuffer : public MemoryMappedFileBuffer {
+  PosixMemoryMappedFileBuffer(void* _base, size_t _length)
+      : MemoryMappedFileBuffer(_base, _length) {}
+  virtual ~PosixMemoryMappedFileBuffer();
 };
 
 class PosixDirectory : public Directory {

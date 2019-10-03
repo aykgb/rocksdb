@@ -13,15 +13,15 @@
 #include <vector>
 
 #include "db/column_family.h"
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/snapshot.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/transaction_db.h"
+#include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/string_util.h"
-#include "util/sync_point.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
 #include "utilities/transactions/transaction_util.h"
 
@@ -37,7 +37,7 @@ TransactionID PessimisticTransaction::GenTxnID() {
 
 PessimisticTransaction::PessimisticTransaction(
     TransactionDB* txn_db, const WriteOptions& write_options,
-    const TransactionOptions& txn_options)
+    const TransactionOptions& txn_options, const bool init)
     : TransactionBaseImpl(txn_db->GetRootDB(), write_options),
       txn_db_impl_(nullptr),
       expiration_time_(0),
@@ -46,11 +46,14 @@ PessimisticTransaction::PessimisticTransaction(
       waiting_key_(nullptr),
       lock_timeout_(0),
       deadlock_detect_(false),
-      deadlock_detect_depth_(0) {
+      deadlock_detect_depth_(0),
+      skip_concurrency_control_(false) {
   txn_db_impl_ =
       static_cast_with_check<PessimisticTransactionDB, TransactionDB>(txn_db);
   db_impl_ = static_cast_with_check<DBImpl, DB>(db_);
-  Initialize(txn_options);
+  if (init) {
+    Initialize(txn_options);
+  }
 }
 
 void PessimisticTransaction::Initialize(const TransactionOptions& txn_options) {
@@ -61,6 +64,7 @@ void PessimisticTransaction::Initialize(const TransactionOptions& txn_options) {
   deadlock_detect_ = txn_options.deadlock_detect;
   deadlock_detect_depth_ = txn_options.deadlock_detect_depth;
   write_batch_.SetMaxBytes(txn_options.max_write_batch_size);
+  skip_concurrency_control_ = txn_options.skip_concurrency_control;
 
   lock_timeout_ = txn_options.lock_timeout * 1000;
   if (lock_timeout_ < 0) {
@@ -82,6 +86,8 @@ void PessimisticTransaction::Initialize(const TransactionOptions& txn_options) {
   if (expiration_time_ > 0) {
     txn_db_impl_->InsertExpirableTransaction(txn_id_, this);
   }
+  use_only_the_last_commit_time_batch_for_recovery_ =
+      txn_options.use_only_the_last_commit_time_batch_for_recovery;
 }
 
 PessimisticTransaction::~PessimisticTransaction() {
@@ -192,10 +198,11 @@ Status PessimisticTransaction::Prepare() {
     txn_state_.store(AWAITING_PREPARE);
     // transaction can't expire after preparation
     expiration_time_ = 0;
+    assert(log_number_ == 0 ||
+           txn_db_impl_->GetTxnDBOptions().write_policy == WRITE_UNPREPARED);
+
     s = PrepareInternal();
     if (s.ok()) {
-      assert(log_number_ != 0);
-      dbimpl_->MarkLogAsContainingPrepSection(log_number_);
       txn_state_.store(PREPARED);
     }
   } else if (txn_state_ == LOCKS_STOLEN) {
@@ -217,10 +224,39 @@ Status WriteCommittedTxn::PrepareInternal() {
   WriteOptions write_options = write_options_;
   write_options.disableWAL = false;
   WriteBatchInternal::MarkEndPrepare(GetWriteBatch()->GetWriteBatch(), name_);
-  Status s =
-      db_impl_->WriteImpl(write_options, GetWriteBatch()->GetWriteBatch(),
-                          /*callback*/ nullptr, &log_number_, /*log ref*/ 0,
-                          /* disable_memtable*/ true);
+  class MarkLogCallback : public PreReleaseCallback {
+   public:
+    MarkLogCallback(DBImpl* db, bool two_write_queues)
+        : db_(db), two_write_queues_(two_write_queues) {
+      (void)two_write_queues_;  // to silence unused private field warning
+    }
+    virtual Status Callback(SequenceNumber, bool is_mem_disabled,
+                            uint64_t log_number, size_t /*index*/,
+                            size_t /*total*/) override {
+#ifdef NDEBUG
+      (void)is_mem_disabled;
+#endif
+      assert(log_number != 0);
+      assert(!two_write_queues_ || is_mem_disabled);  // implies the 2nd queue
+      db_->logs_with_prep_tracker()->MarkLogAsContainingPrepSection(log_number);
+      return Status::OK();
+    }
+
+   private:
+    DBImpl* db_;
+    bool two_write_queues_;
+  } mark_log_callback(db_impl_,
+                      db_impl_->immutable_db_options().two_write_queues);
+
+  WriteCallback* const kNoWriteCallback = nullptr;
+  const uint64_t kRefNoLog = 0;
+  const bool kDisableMemtable = true;
+  SequenceNumber* const KIgnoreSeqUsed = nullptr;
+  const size_t kNoBatchCount = 0;
+  Status s = db_impl_->WriteImpl(
+      write_options, GetWriteBatch()->GetWriteBatch(), kNoWriteCallback,
+      &log_number_, kRefNoLog, kDisableMemtable, KIgnoreSeqUsed, kNoBatchCount,
+      &mark_log_callback);
   return s;
 }
 
@@ -261,7 +297,14 @@ Status PessimisticTransaction::Commit() {
           "Commit-time batch contains values that will not be committed.");
     } else {
       txn_state_.store(AWAITING_COMMIT);
+      if (log_number_ > 0) {
+        dbimpl_->logs_with_prep_tracker()->MarkLogAsHavingPrepSectionFlushed(
+            log_number_);
+      }
       s = CommitWithoutPrepareInternal();
+      if (!name_.empty()) {
+        txn_db_impl_->UnregisterTransaction(this);
+      }
       Clear();
       if (s.ok()) {
         txn_state_.store(COMMITED);
@@ -282,7 +325,8 @@ Status PessimisticTransaction::Commit() {
     // to determine what prep logs must be kept around,
     // not the prep section heap.
     assert(log_number_ > 0);
-    dbimpl_->MarkLogAsHavingPrepSectionFlushed(log_number_);
+    dbimpl_->logs_with_prep_tracker()->MarkLogAsHavingPrepSectionFlushed(
+        log_number_);
     txn_db_impl_->UnregisterTransaction(this);
 
     Clear();
@@ -301,12 +345,27 @@ Status PessimisticTransaction::Commit() {
 }
 
 Status WriteCommittedTxn::CommitWithoutPrepareInternal() {
-  Status s = db_->Write(write_options_, GetWriteBatch()->GetWriteBatch());
+  uint64_t seq_used = kMaxSequenceNumber;
+  auto s =
+      db_impl_->WriteImpl(write_options_, GetWriteBatch()->GetWriteBatch(),
+                          /*callback*/ nullptr, /*log_used*/ nullptr,
+                          /*log_ref*/ 0, /*disable_memtable*/ false, &seq_used);
+  assert(!s.ok() || seq_used != kMaxSequenceNumber);
+  if (s.ok()) {
+    SetId(seq_used);
+  }
   return s;
 }
 
-Status WriteCommittedTxn::CommitBatchInternal(WriteBatch* batch) {
-  Status s = db_->Write(write_options_, batch);
+Status WriteCommittedTxn::CommitBatchInternal(WriteBatch* batch, size_t) {
+  uint64_t seq_used = kMaxSequenceNumber;
+  auto s = db_impl_->WriteImpl(write_options_, batch, /*callback*/ nullptr,
+                               /*log_used*/ nullptr, /*log_ref*/ 0,
+                               /*disable_memtable*/ false, &seq_used);
+  assert(!s.ok() || seq_used != kMaxSequenceNumber);
+  if (s.ok()) {
+    SetId(seq_used);
+  }
   return s;
 }
 
@@ -324,26 +383,44 @@ Status WriteCommittedTxn::CommitInternal() {
   // in non recovery mode and simply insert the values
   WriteBatchInternal::Append(working_batch, GetWriteBatch()->GetWriteBatch());
 
-  auto s = db_impl_->WriteImpl(write_options_, working_batch, nullptr, nullptr,
-                               log_number_);
+  uint64_t seq_used = kMaxSequenceNumber;
+  auto s =
+      db_impl_->WriteImpl(write_options_, working_batch, /*callback*/ nullptr,
+                          /*log_used*/ nullptr, /*log_ref*/ log_number_,
+                          /*disable_memtable*/ false, &seq_used);  
+  assert(!s.ok() || seq_used != kMaxSequenceNumber);
+  if (s.ok()) {
+    SetId(seq_used);
+  }
   return s;
 }
 
-Status WriteCommittedTxn::Rollback() {
+Status PessimisticTransaction::Rollback() {
   Status s;
   if (txn_state_ == PREPARED) {
-    WriteBatch rollback_marker;
-    WriteBatchInternal::MarkRollback(&rollback_marker, name_);
     txn_state_.store(AWAITING_ROLLBACK);
-    s = db_impl_->WriteImpl(write_options_, &rollback_marker);
+
+    s = RollbackInternal();
+
     if (s.ok()) {
       // we do not need to keep our prepared section around
       assert(log_number_ > 0);
-      dbimpl_->MarkLogAsHavingPrepSectionFlushed(log_number_);
+      dbimpl_->logs_with_prep_tracker()->MarkLogAsHavingPrepSectionFlushed(
+          log_number_);
       Clear();
       txn_state_.store(ROLLEDBACK);
     }
   } else if (txn_state_ == STARTED) {
+    if (log_number_ > 0) {
+      assert(txn_db_impl_->GetTxnDBOptions().write_policy == WRITE_UNPREPARED);
+      assert(GetId() > 0);
+      s = RollbackInternal();
+
+      if (s.ok()) {
+        dbimpl_->logs_with_prep_tracker()->MarkLogAsHavingPrepSectionFlushed(
+            log_number_);
+      }
+    }
     // prepare couldn't have taken place
     Clear();
   } else if (txn_state_ == COMMITED) {
@@ -353,6 +430,13 @@ Status WriteCommittedTxn::Rollback() {
         "Two phase transaction is not in state for rollback.");
   }
 
+  return s;
+}
+
+Status WriteCommittedTxn::RollbackInternal() {
+  WriteBatch rollback_marker;
+  WriteBatchInternal::MarkRollback(&rollback_marker, name_);
+  auto s = db_impl_->WriteImpl(write_options_, &rollback_marker);
   return s;
 }
 
@@ -396,18 +480,17 @@ Status PessimisticTransaction::LockBatch(WriteBatch* batch,
       }
     }
 
-    virtual Status PutCF(uint32_t column_family_id, const Slice& key,
-                         const Slice& /* unused */) override {
+    Status PutCF(uint32_t column_family_id, const Slice& key,
+                 const Slice& /* unused */) override {
       RecordKey(column_family_id, key);
       return Status::OK();
     }
-    virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
-                           const Slice& /* unused */) override {
+    Status MergeCF(uint32_t column_family_id, const Slice& key,
+                   const Slice& /* unused */) override {
       RecordKey(column_family_id, key);
       return Status::OK();
     }
-    virtual Status DeleteCF(uint32_t column_family_id,
-                            const Slice& key) override {
+    Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
       RecordKey(column_family_id, key);
       return Status::OK();
     }
@@ -454,16 +537,20 @@ Status PessimisticTransaction::LockBatch(WriteBatch* batch,
 // the snapshot time.
 Status PessimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
                                        const Slice& key, bool read_only,
-                                       bool exclusive, bool untracked) {
+                                       bool exclusive, const bool do_validate,
+                                       const bool assume_tracked) {
+  assert(!assume_tracked || !do_validate);
+  Status s;
+  if (UNLIKELY(skip_concurrency_control_)) {
+    return s;
+  }
   uint32_t cfh_id = GetColumnFamilyID(column_family);
   std::string key_str = key.ToString();
   bool previously_locked;
   bool lock_upgrade = false;
-  Status s;
 
   // lock this key if this transactions hasn't already locked it
-  SequenceNumber current_seqno = kMaxSequenceNumber;
-  SequenceNumber new_seqno = kMaxSequenceNumber;
+  SequenceNumber tracked_at_seq = kMaxSequenceNumber;
 
   const auto& tracked_keys = GetTrackedKeys();
   const auto tracked_keys_cf = tracked_keys.find(cfh_id);
@@ -478,7 +565,7 @@ Status PessimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
         lock_upgrade = true;
       }
       previously_locked = true;
-      current_seqno = iter->second.seq;
+      tracked_at_seq = iter->second.seq;
     }
   }
 
@@ -496,23 +583,32 @@ Status PessimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
   // any writes since this transaction's snapshot.
   // TODO(agiardullo): could optimize by supporting shared txn locks in the
   // future
-  if (untracked || snapshot_ == nullptr) {
+  if (!do_validate || snapshot_ == nullptr) {
+    if (assume_tracked && !previously_locked) {
+      s = Status::InvalidArgument(
+          "assume_tracked is set but it is not tracked yet");
+    }
     // Need to remember the earliest sequence number that we know that this
     // key has not been modified after.  This is useful if this same
     // transaction
     // later tries to lock this key again.
-    if (current_seqno == kMaxSequenceNumber) {
+    if (tracked_at_seq == kMaxSequenceNumber) {
       // Since we haven't checked a snapshot, we only know this key has not
       // been modified since after we locked it.
-      new_seqno = db_->GetLatestSequenceNumber();
-    } else {
-      new_seqno = current_seqno;
+      // Note: when last_seq_same_as_publish_seq_==false this is less than the
+      // latest allocated seq but it is ok since i) this is just a heuristic
+      // used only as a hint to avoid actual check for conflicts, ii) this would
+      // cause a false positive only if the snapthot is taken right after the
+      // lock, which would be an unusual sequence.
+      tracked_at_seq = db_->GetLatestSequenceNumber();
     }
   } else {
     // If a snapshot is set, we need to make sure the key hasn't been modified
     // since the snapshot.  This must be done after we locked the key.
+    // If we already have validated an earilier snapshot it must has been
+    // reflected in tracked_at_seq and ValidateSnapshot will return OK.
     if (s.ok()) {
-      s = ValidateSnapshot(column_family, key, current_seqno, &new_seqno);
+      s = ValidateSnapshot(column_family, key, &tracked_at_seq);
 
       if (!s.ok()) {
         // Failed to validate key
@@ -531,8 +627,28 @@ Status PessimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
   }
 
   if (s.ok()) {
-    // Let base class know we've conflict checked this key.
-    TrackKey(cfh_id, key_str, new_seqno, read_only, exclusive);
+    // We must track all the locked keys so that we can unlock them later. If
+    // the key is already locked, this func will update some stats on the
+    // tracked key. It could also update the tracked_at_seq if it is lower
+    // than the existing tracked key seq. These stats are necessary for
+    // RollbackToSavePoint to determine whether a key can be safely removed
+    // from tracked_keys_. Removal can only be done if a key was only locked
+    // during the current savepoint.
+    //
+    // Recall that if assume_tracked is true, we assume that TrackKey has been
+    // called previously since the last savepoint, with the same exclusive
+    // setting, and at a lower sequence number, so skipping here should be
+    // safe.
+    if (!assume_tracked) {
+      TrackKey(cfh_id, key_str, tracked_at_seq, read_only, exclusive);
+    } else {
+#ifndef NDEBUG
+      assert(tracked_keys_cf->second.count(key_str) > 0);
+      const auto& info = tracked_keys_cf->second.find(key_str)->second;
+      assert(info.seq <= tracked_at_seq);
+      assert(info.exclusive == exclusive);
+#endif
+    }
   }
 
   return s;
@@ -540,27 +656,33 @@ Status PessimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
 
 // Return OK() if this key has not been modified more recently than the
 // transaction snapshot_.
+// tracked_at_seq is the global seq at which we either locked the key or already
+// have done ValidateSnapshot.
 Status PessimisticTransaction::ValidateSnapshot(
     ColumnFamilyHandle* column_family, const Slice& key,
-    SequenceNumber prev_seqno, SequenceNumber* new_seqno) {
+    SequenceNumber* tracked_at_seq) {
   assert(snapshot_);
 
-  SequenceNumber seq = snapshot_->GetSequenceNumber();
-  if (prev_seqno <= seq) {
-    // If the key has been previous validated at a sequence number earlier
-    // than the curent snapshot's sequence number, we already know it has not
-    // been modified.
+  SequenceNumber snap_seq = snapshot_->GetSequenceNumber();
+  if (*tracked_at_seq <= snap_seq) {
+    // If the key has been previous validated (or locked) at a sequence number
+    // earlier than the current snapshot's sequence number, we already know it
+    // has not been modified aftter snap_seq either.
     return Status::OK();
   }
+  // Otherwise we have either
+  // 1: tracked_at_seq == kMaxSequenceNumber, i.e., first time tracking the key
+  // 2: snap_seq < tracked_at_seq: last time we lock the key was via
+  // do_validate=false which means we had skipped ValidateSnapshot. In both
+  // cases we should do ValidateSnapshot now.
 
-  *new_seqno = seq;
+  *tracked_at_seq = snap_seq;
 
   ColumnFamilyHandle* cfh =
       column_family ? column_family : db_impl_->DefaultColumnFamily();
 
-  return TransactionUtil::CheckKeyForConflicts(db_impl_, cfh, key.ToString(),
-                                               snapshot_->GetSequenceNumber(),
-                                               false /* cache_only */);
+  return TransactionUtil::CheckKeyForConflicts(
+      db_impl_, cfh, key.ToString(), snap_seq, false /* cache_only */);
 }
 
 bool PessimisticTransaction::TryStealingLocks() {
