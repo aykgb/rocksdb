@@ -1023,6 +1023,9 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
         continue;
       }
 
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::RecoverLogFiles:BeforeFlushFinalMemtable", /*arg=*/nullptr);
+
       // flush the final memtable (if non-empty)
       if (cfd->mem()->GetFirstSequenceNumber() != 0) {
         // If flush happened in the middle of recovery (e.g. due to memtable
@@ -1042,7 +1045,9 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
         data_seen = true;
       }
 
-      // write MANIFEST with update
+      // Update the log number info in the version edit corresponding to this
+      // column family. Note that the version edits will be written to MANIFEST
+      // together later.
       // writing log_number in the manifest means that any log file
       // with number strongly less than (log_number + 1) is already
       // recovered and should be ignored on next reincarnation.
@@ -1051,19 +1056,28 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
       if (flushed || cfd->mem()->GetFirstSequenceNumber() == 0) {
         edit->SetLogNumber(max_log_number + 1);
       }
+    }
+    if (status.ok()) {
       // we must mark the next log number as used, even though it's
       // not actually used. that is because VersionSet assumes
       // VersionSet::next_file_number_ always to be strictly greater than any
       // log number
       versions_->MarkFileNumberUsed(max_log_number + 1);
-      status = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(),
-                                      edit, &mutex_);
-      TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:AfterLogAndApply",
-                               nullptr);
-      if (!status.ok()) {
-        // Recovery failed
-        break;
+
+      autovector<ColumnFamilyData*> cfds;
+      autovector<const MutableCFOptions*> cf_opts;
+      autovector<autovector<VersionEdit*>> edit_lists;
+      for (auto* cfd : *versions_->GetColumnFamilySet()) {
+        cfds.push_back(cfd);
+        cf_opts.push_back(cfd->GetLatestMutableCFOptions());
+        auto iter = version_edits.find(cfd->GetID());
+        assert(iter != version_edits.end());
+        edit_lists.push_back({&iter->second});
       }
+      // write MANIFEST with update
+      status = versions_->LogAndApply(cfds, cf_opts, edit_lists, &mutex_,
+                                      directories_.GetDbDir(),
+                                      /*new_descriptor_log=*/true);
     }
   }
 
@@ -1136,8 +1150,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
-  auto pending_outputs_inserted_elem =
-      CaptureCurrentFileNumberInPendingOutputs();
+  std::unique_ptr<std::list<uint64_t>::iterator> pending_outputs_inserted_elem(
+      new std::list<uint64_t>::iterator(
+          CaptureCurrentFileNumberInPendingOutputs()));
   meta.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
   ReadOptions ro;
   ro.total_order_seek = true;
@@ -1160,6 +1175,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     int64_t _current_time = 0;
     env_->GetCurrentTime(&_current_time);  // ignore error
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
+    meta.oldest_ancester_time = current_time;
 
     {
       auto write_hint = cfd->CalculateSSTWriteHint(0);
@@ -1209,7 +1225,8 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     edit->AddFile(level, meta.fd.GetNumber(), meta.fd.GetPathId(),
                   meta.fd.GetFileSize(), meta.smallest, meta.largest,
                   meta.fd.smallest_seqno, meta.fd.largest_seqno,
-                  meta.marked_for_compaction);
+                  meta.marked_for_compaction, meta.oldest_blob_file_number,
+                  meta.oldest_ancester_time, meta.file_creation_time);
   }
 
   InternalStats::CompactionStats stats(CompactionReason::kFlush, 1);

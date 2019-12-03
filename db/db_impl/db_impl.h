@@ -199,11 +199,15 @@ class DBImpl : public DB {
                         PinnableSlice* values, Status* statuses,
                         const bool sorted_input = false) override;
 
-  void MultiGetImpl(
+  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
+                        ColumnFamilyHandle** column_families, const Slice* keys,
+                        PinnableSlice* values, Status* statuses,
+                        const bool sorted_input = false) override;
+
+  virtual void MultiGetWithCallback(
       const ReadOptions& options, ColumnFamilyHandle* column_family,
-      autovector<KeyContext, MultiGetContext::MAX_BATCH_SIZE>& key_context,
-      bool sorted_input, ReadCallback* callback = nullptr,
-      bool* is_blob_index = nullptr);
+      ReadCallback* callback,
+      autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys);
 
   virtual Status CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                     const std::string& column_family,
@@ -349,6 +353,8 @@ class DBImpl : public DB {
   virtual Status GetSortedWalFiles(VectorLogPtr& files) override;
   virtual Status GetCurrentWalFile(
       std::unique_ptr<LogFile>* current_log_file) override;
+  virtual Status GetCreationTimeOfOldestFile(
+      uint64_t* creation_time) override;
 
   virtual Status GetUpdatesSince(
       SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
@@ -1005,11 +1011,11 @@ class DBImpl : public DB {
 
   void NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
                           const MutableCFOptions& mutable_cf_options,
-                          int job_id, TableProperties prop);
+                          int job_id);
 
-  void NotifyOnFlushCompleted(ColumnFamilyData* cfd, FileMetaData* file_meta,
-                              const MutableCFOptions& mutable_cf_options,
-                              int job_id, TableProperties prop);
+  void NotifyOnFlushCompleted(
+      ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+      std::list<std::unique_ptr<FlushJobInfo>>* flush_jobs_info);
 
   void NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
                                const Status& st,
@@ -1102,6 +1108,8 @@ class DBImpl : public DB {
       const std::vector<ColumnFamilyDescriptor>& column_families,
       bool read_only = false, bool error_if_log_file_exist = false,
       bool error_if_data_exists_in_logs = false);
+
+  virtual bool OwnTablesAndLogs() const { return true; }
 
  private:
   friend class DB;
@@ -1313,7 +1321,8 @@ class DBImpl : public DB {
   // created between the calls CaptureCurrentFileNumberInPendingOutputs() and
   // ReleaseFileNumberFromPendingOutputs() can now be deleted (if it's not live
   // and blocked by any other pending_outputs_ calls)
-  void ReleaseFileNumberFromPendingOutputs(std::list<uint64_t>::iterator v);
+  void ReleaseFileNumberFromPendingOutputs(
+      std::unique_ptr<std::list<uint64_t>::iterator>& v);
 
   Status SyncClosedLogs(JobContext* job_context);
 
@@ -1406,10 +1415,22 @@ class DBImpl : public DB {
       bool resuming_from_bg_err);
 
   inline void WaitForPendingWrites() {
+    mutex_.AssertHeld();
+    // In case of pipelined write is enabled, wait for all pending memtable
+    // writers.
+    if (immutable_db_options_.enable_pipelined_write) {
+      // Memtable writers may call DB::Get in case max_successive_merges > 0,
+      // which may lock mutex. Unlocking mutex here to avoid deadlock.
+      mutex_.Unlock();
+      write_thread_.WaitForMemTableWriters();
+      mutex_.Lock();
+    }
+
     if (!immutable_db_options_.unordered_write) {
       // Then the writes are finished before the next write group starts
       return;
     }
+
     // Wait for the ones who already wrote to the WAL to finish their
     // memtable write.
     if (pending_memtable_writes_.load() != 0) {
@@ -1605,7 +1626,7 @@ class DBImpl : public DB {
   // Write a version edit to the MANIFEST.
   Status ReserveFileNumbersBeforeIngestion(
       ColumnFamilyData* cfd, uint64_t num,
-      std::list<uint64_t>::iterator* pending_output_elem,
+      std::unique_ptr<std::list<uint64_t>::iterator>& pending_output_elem,
       uint64_t* next_file_number);
 #endif  //! ROCKSDB_LITE
 
@@ -1624,6 +1645,81 @@ class DBImpl : public DB {
   static Status ValidateOptions(
       const DBOptions& db_options,
       const std::vector<ColumnFamilyDescriptor>& column_families);
+
+  // Utility function to do some debug validation and sort the given vector
+  // of MultiGet keys
+  void PrepareMultiGetKeys(
+      const size_t num_keys, bool sorted,
+      autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* key_ptrs);
+
+  // A structure to hold the information required to process MultiGet of keys
+  // belonging to one column family. For a multi column family MultiGet, there
+  // will be a container of these objects.
+  struct MultiGetColumnFamilyData {
+    ColumnFamilyHandle* cf;
+    ColumnFamilyData* cfd;
+
+    // For the batched MultiGet which relies on sorted keys, start specifies
+    // the index of first key belonging to this column family in the sorted
+    // list.
+    size_t start;
+
+    // For the batched MultiGet case, num_keys specifies the number of keys
+    // belonging to this column family in the sorted list
+    size_t num_keys;
+
+    // SuperVersion for the column family obtained in a manner that ensures a
+    // consistent view across all column families in the DB
+    SuperVersion* super_version;
+    MultiGetColumnFamilyData(ColumnFamilyHandle* column_family,
+                             SuperVersion* sv)
+        : cf(column_family),
+          cfd(static_cast<ColumnFamilyHandleImpl*>(cf)->cfd()),
+          start(0),
+          num_keys(0),
+          super_version(sv) {}
+
+    MultiGetColumnFamilyData(ColumnFamilyHandle* column_family, size_t first,
+                             size_t count, SuperVersion* sv)
+        : cf(column_family),
+          cfd(static_cast<ColumnFamilyHandleImpl*>(cf)->cfd()),
+          start(first),
+          num_keys(count),
+          super_version(sv) {}
+
+    MultiGetColumnFamilyData() = default;
+  };
+
+  // A common function to obtain a consistent snapshot, which can be implicit
+  // if the user doesn't specify a snapshot in read_options, across
+  // multiple column families for MultiGet. It will attempt to get an implicit
+  // snapshot without acquiring the db_mutes, but will give up after a few
+  // tries and acquire the mutex if a memtable flush happens. The template
+  // allows both the batched and non-batched MultiGet to call this with
+  // either an std::unordered_map or autovector of column families.
+  //
+  // If callback is non-null, the callback is refreshed with the snapshot
+  // sequence number
+  //
+  // A return value of true indicates that the SuperVersions were obtained
+  // from the ColumnFamilyData, whereas false indicates they are thread
+  // local
+  template <class T>
+  bool MultiCFSnapshot(
+      const ReadOptions& read_options, ReadCallback* callback,
+      std::function<MultiGetColumnFamilyData*(typename T::iterator&)>&
+          iter_deref_func,
+      T* cf_list, SequenceNumber* snapshot);
+
+  // The actual implementation of the batching MultiGet. The caller is expected
+  // to have acquired the SuperVersion and pass in a snapshot sequence number
+  // in order to construct the LookupKeys. The start_key and num_keys specify
+  // the range of keys in the sorted_keys vector for a single column family.
+  void MultiGetImpl(
+      const ReadOptions& read_options, size_t start_key, size_t num_keys,
+      autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys,
+      SuperVersion* sv, SequenceNumber snap_seqnum, ReadCallback* callback,
+      bool* is_blob_index);
 
   // table_cache_ provides its own synchronization
   std::shared_ptr<Cache> table_cache_;
